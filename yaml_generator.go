@@ -14,10 +14,15 @@ import (
 	"strings"
 )
 
+type GeneratorTable struct {
+	Flag      uint
+	ModelName string
+}
+
 type YamlGenerator struct {
 	yaml                *DbTable
 	gen                 *gen.Generator
-	generatedTable      map[string]string
+	generatedTable      map[string]*GeneratorTable
 	columnOptionSaveDir string
 }
 
@@ -28,18 +33,18 @@ func NewYamlGenerator(path string) *YamlGenerator {
 		panic(err)
 		return nil
 	}
-	obj.generatedTable = make(map[string]string)
+	obj.generatedTable = make(map[string]*GeneratorTable)
 	return obj
 }
 
 type DbTable struct {
-	Config   Config  `yaml:"config"`
-	Table    []Table `yaml:"relation"`
-	TableMap map[string]*Table
+	Config         Config  `yaml:"config"`
+	Table          []Table `yaml:"relation"`
+	TableMap       map[string]*Table
+	RelateTableMap map[string]struct{}
 }
 
 type Table struct {
-	Flag   uint
 	Name   string            `yaml:"table"`
 	Relate []Relate          `yaml:"relate"`
 	Column map[string]Column `yaml:"column"`
@@ -90,10 +95,15 @@ func (y *YamlGenerator) loadFromFile(path string) error {
 		return err
 	}
 	y.yaml.TableMap = make(map[string]*Table)
+	y.yaml.RelateTableMap = make(map[string]struct{})
 
 	for _, table := range y.yaml.Table {
 		t := table
 		y.yaml.TableMap[table.Name] = &t
+
+		for _, relateTable := range table.Relate {
+			y.yaml.RelateTableMap[relateTable.Table] = struct{}{}
+		}
 	}
 
 	return nil
@@ -170,7 +180,7 @@ func (y *YamlGenerator) getTableRelateOpt(table *Table) []gen.ModelOpt {
 			table.JSONTag = NamingConversion(table.Table, y.yaml.Config.TagJsonCamel) + ",omitempty"
 		}
 
-		opt[i] = gen.FieldRelate(fieldType, y.generatedTable[table.Table], y.gen.Data[y.generatedTable[table.Table]].QueryStructMeta, &field.RelateConfig{
+		opt[i] = gen.FieldRelate(fieldType, y.generatedTable[table.Table].ModelName, y.gen.Data[y.generatedTable[table.Table].ModelName].QueryStructMeta, &field.RelateConfig{
 			GORMTag:       relateConfig,
 			RelatePointer: relatePointer,
 			JSONTag:       table.JSONTag,
@@ -279,20 +289,30 @@ func (y *YamlGenerator) getTableColumnOpt(table *Table) ([]gen.ModelOpt, bool) {
 }
 
 func (y *YamlGenerator) generateFromTable(table *Table, opt ...gen.ModelOpt) {
-	if _, exists := y.generatedTable[table.Name]; exists {
+	if generatedTable, exists := y.generatedTable[table.Name]; exists && generatedTable.Flag == 2 {
 		return
 	}
-	table.Flag = 1
 
 	for _, relate := range table.Relate {
-		if tTable, exists := y.yaml.TableMap[relate.Table]; exists {
-			if tTable.Flag == 0 {
-				y.generateFromTable(tTable, opt...)
-			}
+		_, isInRelateTable := y.yaml.RelateTableMap[relate.Table]
+
+		if !isInRelateTable {
+			y.generateFromTable(y.yaml.TableMap[relate.Table], opt...)
 		} else {
+			if _, exists := y.generatedTable[relate.Table]; exists {
+				continue
+			}
+			flag := 1
+			_, isInTable := y.yaml.TableMap[relate.Table]
+			if !isInTable {
+				flag = 2
+			}
 			relateMate := y.gen.GenerateModel(relate.Table, opt...)
 			y.gen.ApplyBasic(relateMate)
-			y.generatedTable[relate.Table] = relateMate.ModelStructName
+			y.generatedTable[relate.Table] = &GeneratorTable{
+				Flag:      uint(flag),
+				ModelName: relateMate.ModelStructName,
+			}
 		}
 	}
 
@@ -316,10 +336,13 @@ func (y *YamlGenerator) generateFromTable(table *Table, opt ...gen.ModelOpt) {
 		relateMate.ImportPkgPaths = append(relateMate.ImportPkgPaths, "\""+pkgs[0].PkgPath+"\"")
 	}
 	if _, exists := y.generatedTable[table.Name]; exists {
-		delete(y.gen.Data, y.generatedTable[table.Name])
+		delete(y.gen.Data, y.generatedTable[table.Name].ModelName)
 	}
 	y.gen.ApplyBasic(relateMate)
-	y.generatedTable[table.Name] = relateMate.ModelStructName
+	y.generatedTable[table.Name] = &GeneratorTable{
+		Flag:      2,
+		ModelName: relateMate.ModelStructName,
+	}
 }
 
 func (y *YamlGenerator) Generate(opt ...gen.ModelOpt) {

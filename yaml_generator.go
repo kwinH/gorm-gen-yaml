@@ -10,12 +10,21 @@ import (
 	"gorm.io/gen/field"
 	"io"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 )
 
+// TableGenStatus 表生成状态
+type TableGenStatus uint
+
+const (
+	TableGenStatusNone    TableGenStatus = 0 // 未生成
+	TableGenStatusPending TableGenStatus = 1 // 生成中
+	TableGenStatusDone    TableGenStatus = 2 // 已完成
+)
+
 type GeneratorTable struct {
-	Flag      uint
+	Status    TableGenStatus
 	ModelName string
 }
 
@@ -31,7 +40,6 @@ func NewYamlGenerator(path string) *YamlGenerator {
 	err := obj.loadFromFile(path)
 	if err != nil {
 		panic(err)
-		return nil
 	}
 	obj.generatedTable = make(map[string]*GeneratorTable)
 	return obj
@@ -84,11 +92,17 @@ func (y *YamlGenerator) UseGormGenerator(g *gen.Generator) *YamlGenerator {
 }
 
 func (y *YamlGenerator) loadFromFile(path string) error {
-	file, err := os.OpenFile(path, os.O_RDWR, os.ModePerm)
+	file, err := os.Open(path)
 	if err != nil {
-		return errors.New(fmt.Sprintf("%s file not found", path))
+		return fmt.Errorf("%s file not found: %w", path, err)
 	}
-	content, _ := io.ReadAll(file)
+	defer file.Close()
+
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return fmt.Errorf("failed to read file %s: %w", path, err)
+	}
+
 	y.yaml = &DbTable{}
 	err = yaml.Unmarshal(content, y.yaml)
 	if err != nil {
@@ -130,10 +144,10 @@ func (y *YamlGenerator) generateColumnOption(column Column) error {
 	if !exists {
 		return errors.New("serializer type not support")
 	}
-	columnOptionTemplate = strings.Replace(columnOptionTemplate, "{{Package}}", strings.TrimRight(path.Base(y.columnOptionSaveDir), "/"), 1)
+	columnOptionTemplate = strings.Replace(columnOptionTemplate, "{{Package}}", filepath.Base(y.columnOptionSaveDir), 1)
 	columnOptionTemplate = strings.Replace(columnOptionTemplate, "{{OptionStructName}}", column.Type, -1)
 
-	p := y.columnOptionSaveDir + "/" + CamelCaseToUnderscore(column.Type) + ".go"
+	p := filepath.Join(y.columnOptionSaveDir, CamelCaseToUnderscore(column.Type)+".go")
 	_, err := os.Stat(p)
 	if os.IsNotExist(err) {
 		return os.WriteFile(p, []byte(columnOptionTemplate), 0640)
@@ -143,10 +157,10 @@ func (y *YamlGenerator) generateColumnOption(column Column) error {
 
 func (y *YamlGenerator) getTableRelateOpt(table *Table) []gen.ModelOpt {
 	opt := make([]gen.ModelOpt, len(table.Relate))
-	for i, table := range table.Relate {
+	for i, relate := range table.Relate {
 		relatePointer := false
 		var fieldType field.RelationshipType
-		switch table.Type {
+		switch relate.Type {
 		case "has_one":
 			fieldType = field.HasOne
 			relatePointer = true
@@ -158,36 +172,56 @@ func (y *YamlGenerator) getTableRelateOpt(table *Table) []gen.ModelOpt {
 			fieldType = field.BelongsTo
 			relatePointer = true
 		}
-		relateConfig := make(field.GormTag)
+		relateConfig := y.buildRelateConfig(relate)
 
-		if table.ForeignKey != "" {
-			relateConfig.Append("foreignKey", table.ForeignKey)
-		}
-		if table.JoinForeignKey != "" {
-			relateConfig.Append("joinForeignKey", table.JoinForeignKey)
-		}
-		if table.References != "" {
-			relateConfig.Append("references", table.References)
-		}
-		if table.JoinReferences != "" {
-			relateConfig.Append("joinReferences", table.JoinReferences)
-		}
-		if table.Many2many != "" {
-			relateConfig.Append("many2many", table.Many2many)
+		generatedTable, exists := y.generatedTable[relate.Table]
+		if !exists {
+			panic(fmt.Sprintf("table %s not generated yet, cannot create relation", relate.Table))
 		}
 
-		if table.JSONTag == "" {
-			table.JSONTag = NamingConversion(table.Table, y.yaml.Config.TagJsonCamel) + ",omitempty"
+		queryStructMeta, ok := y.gen.Data[generatedTable.ModelName]
+		if !ok || queryStructMeta.QueryStructMeta == nil {
+			panic(fmt.Sprintf("QueryStructMeta for table %s not found", relate.Table))
 		}
 
-		opt[i] = gen.FieldRelate(fieldType, y.generatedTable[table.Table].ModelName, y.gen.Data[y.generatedTable[table.Table].ModelName].QueryStructMeta, &field.RelateConfig{
+		opt[i] = gen.FieldRelate(fieldType, generatedTable.ModelName, queryStructMeta.QueryStructMeta, &field.RelateConfig{
 			GORMTag:       relateConfig,
 			RelatePointer: relatePointer,
-			JSONTag:       table.JSONTag,
+			JSONTag:       relate.JSONTag,
 		})
 	}
 
 	return opt
+}
+
+// buildRelateConfig 构建关联配置
+func (y *YamlGenerator) buildRelateConfig(relate Relate) field.GormTag {
+	relateConfig := make(field.GormTag)
+
+	type tagMapping struct {
+		yamlKey string
+		gormKey string
+	}
+
+	mappings := []tagMapping{
+		{relate.ForeignKey, "foreignKey"},
+		{relate.JoinForeignKey, "joinForeignKey"},
+		{relate.References, "references"},
+		{relate.JoinReferences, "joinReferences"},
+		{relate.Many2many, "many2many"},
+	}
+
+	for _, mapping := range mappings {
+		if mapping.yamlKey != "" {
+			relateConfig.Append(mapping.gormKey, mapping.yamlKey)
+		}
+	}
+
+	if relate.JSONTag == "" {
+		relate.JSONTag = NamingConversion(relate.Table, y.yaml.Config.TagJsonCamel) + ",omitempty"
+	}
+
+	return relateConfig
 }
 
 func (y *YamlGenerator) getTableColumnOpt(table *Table) ([]gen.ModelOpt, bool) {
@@ -216,7 +250,7 @@ func (y *YamlGenerator) getTableColumnOpt(table *Table) ([]gen.ModelOpt, bool) {
 				}
 
 				hasOption = true
-				opt = append(opt, gen.FieldType(name, "*"+strings.TrimRight(path.Base(y.columnOptionSaveDir), "/")+"."+column.Type))
+				opt = append(opt, gen.FieldType(name, "*"+filepath.Base(y.columnOptionSaveDir)+"."+column.Type))
 			} else {
 				opt = append(opt, gen.FieldType(name, column.Type))
 			}
@@ -279,7 +313,7 @@ func (y *YamlGenerator) getTableColumnOpt(table *Table) ([]gen.ModelOpt, bool) {
 				panic(err)
 			}
 			hasOption = true
-			columnType = "*" + strings.TrimRight(path.Base(y.columnOptionSaveDir), "/") + "." + column.Type
+			columnType = "*" + filepath.Base(y.columnOptionSaveDir) + "." + column.Type
 		}
 
 		opt = append(opt, gen.FieldNew(UnderscoreToCamelCase(name, true), columnType, tag))
@@ -288,43 +322,19 @@ func (y *YamlGenerator) getTableColumnOpt(table *Table) ([]gen.ModelOpt, bool) {
 	return opt, hasOption
 }
 
-func (y *YamlGenerator) generateFromTable(table *Table, opt ...gen.ModelOpt) {
-	if generatedTable, exists := y.generatedTable[table.Name]; exists && generatedTable.Flag == 2 {
-		return
+// generateSimpleTable 生成简单表（无自定义列配置）
+func (y *YamlGenerator) generateSimpleTable(tableName string, status TableGenStatus, opt ...gen.ModelOpt) {
+	relateMate := y.gen.GenerateModel(tableName, opt...)
+	y.gen.ApplyBasic(relateMate)
+	y.generatedTable[tableName] = &GeneratorTable{
+		Status:    status,
+		ModelName: relateMate.ModelStructName,
 	}
+}
 
-	for _, relate := range table.Relate {
-		_, isInRelateTable := y.yaml.RelateTableMap[relate.Table]
-
-		if !isInRelateTable {
-			y.generateFromTable(y.yaml.TableMap[relate.Table], opt...)
-		} else {
-			if _, exists := y.generatedTable[relate.Table]; exists {
-				continue
-			}
-			flag := 1
-			_, isInTable := y.yaml.TableMap[relate.Table]
-			if !isInTable {
-				flag = 2
-			}
-			relateMate := y.gen.GenerateModel(relate.Table, opt...)
-			y.gen.ApplyBasic(relateMate)
-			y.generatedTable[relate.Table] = &GeneratorTable{
-				Flag:      uint(flag),
-				ModelName: relateMate.ModelStructName,
-			}
-		}
-	}
-
-	//找到所有relate,生成模型
-	relateOpt := y.getTableRelateOpt(table)
-	columnOpt, hasOption := y.getTableColumnOpt(table)
-	if opt == nil {
-		opt = make([]gen.ModelOpt, 0)
-	}
-	opt = append(opt, relateOpt...)
-	opt = append(opt, columnOpt...)
-	relateMate := y.gen.GenerateModel(table.Name, opt...)
+// applyModelWithPackage 生成模型并处理包导入
+func (y *YamlGenerator) applyModelWithPackage(tableName string, tableOpt []gen.ModelOpt, hasOption bool) {
+	relateMate := y.gen.GenerateModel(tableName, tableOpt...)
 	if hasOption {
 		pkgs, err := packages.Load(&packages.Config{
 			Mode: packages.NeedName,
@@ -335,14 +345,92 @@ func (y *YamlGenerator) generateFromTable(table *Table, opt ...gen.ModelOpt) {
 		}
 		relateMate.ImportPkgPaths = append(relateMate.ImportPkgPaths, "\""+pkgs[0].PkgPath+"\"")
 	}
-	if _, exists := y.generatedTable[table.Name]; exists {
-		delete(y.gen.Data, y.generatedTable[table.Name].ModelName)
+
+	// 删除旧数据，应用新数据
+	if generatedTable, exists := y.generatedTable[tableName]; exists {
+		delete(y.gen.Data, generatedTable.ModelName)
 	}
 	y.gen.ApplyBasic(relateMate)
-	y.generatedTable[table.Name] = &GeneratorTable{
-		Flag:      2,
+	y.generatedTable[tableName] = &GeneratorTable{
+		Status:    TableGenStatusDone,
 		ModelName: relateMate.ModelStructName,
 	}
+}
+
+func (y *YamlGenerator) generateFromTable(table *Table, opt ...gen.ModelOpt) {
+	// 检查是否已经生成过，避免重复处理
+	if _, exists := y.generatedTable[table.Name]; exists {
+		return
+	}
+
+	// 提前标记为生成中，防止循环依赖
+	y.generatedTable[table.Name] = &GeneratorTable{
+		Status:    TableGenStatusPending,
+		ModelName: "",
+	}
+
+	// 先递归生成所有关联表（不处理关联字段）
+	for _, relate := range table.Relate {
+		_, isInRelateTable := y.yaml.RelateTableMap[relate.Table]
+
+		if !isInRelateTable {
+			// 递归生成不在 RelateTableMap 中的表
+			if _, exists := y.generatedTable[relate.Table]; !exists {
+				y.generateFromTable(y.yaml.TableMap[relate.Table], opt...)
+			}
+		} else {
+			// 直接生成在 RelateTableMap 中的表
+			if _, exists := y.generatedTable[relate.Table]; exists {
+				continue
+			}
+			status := TableGenStatusPending
+			_, isInTable := y.yaml.TableMap[relate.Table]
+			if !isInTable {
+				status = TableGenStatusDone
+			}
+			y.generateSimpleTable(relate.Table, status, opt...)
+		}
+	}
+
+	// 生成当前表（不包含关联字段）
+	columnOpt, hasOption := y.getTableColumnOpt(table)
+	tableOpt := make([]gen.ModelOpt, 0, len(opt)+len(columnOpt))
+	tableOpt = append(tableOpt, opt...)
+	tableOpt = append(tableOpt, columnOpt...)
+
+	y.applyModelWithPackage(table.Name, tableOpt, hasOption)
+}
+
+// addRelationFields 为所有表添加关联字段（第二阶段）
+func (y *YamlGenerator) addRelationFields(opt ...gen.ModelOpt) {
+	// 遍历所有有 Relate 的表，重新生成并添加关联字段
+	// 由于第一阶段已生成所有表的基础结构，这里只需一次遍历即可
+	for _, table := range y.yaml.Table {
+		t := y.yaml.TableMap[table.Name]
+		if t == nil || len(t.Relate) == 0 {
+			continue
+		}
+
+		y.regenerateTableWithRelations(t, opt...)
+	}
+}
+
+// regenerateTableWithRelations 重新生成表，添加关联字段
+func (y *YamlGenerator) regenerateTableWithRelations(table *Table, opt ...gen.ModelOpt) {
+	// 获取关联字段选项
+	relateOpt := y.getTableRelateOpt(table)
+	if len(relateOpt) == 0 {
+		return
+	}
+
+	// 重新生成模型，添加关联字段
+	columnOpt, hasOption := y.getTableColumnOpt(table)
+	tableOpt := make([]gen.ModelOpt, 0, len(opt)+len(relateOpt)+len(columnOpt))
+	tableOpt = append(tableOpt, opt...)
+	tableOpt = append(tableOpt, relateOpt...)
+	tableOpt = append(tableOpt, columnOpt...)
+
+	y.applyModelWithPackage(table.Name, tableOpt, hasOption)
 }
 
 func (y *YamlGenerator) Generate(opt ...gen.ModelOpt) {
@@ -351,7 +439,12 @@ func (y *YamlGenerator) Generate(opt ...gen.ModelOpt) {
 			return NamingConversion(columnName, y.yaml.Config.TagJsonCamel)
 		})
 	}
-	for _, table := range y.yaml.TableMap {
-		y.generateFromTable(table, opt...)
+
+	// 第一阶段：生成所有表的基础结构（不包含关联字段）
+	for _, table := range y.yaml.Table {
+		y.generateFromTable(y.yaml.TableMap[table.Name], opt...)
 	}
+
+	// 第二阶段：为所有表添加关联字段
+	y.addRelationFields(opt...)
 }

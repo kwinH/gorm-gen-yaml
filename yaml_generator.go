@@ -172,7 +172,7 @@ func (y *YamlGenerator) getTableRelateOpt(table *Table) []gen.ModelOpt {
 			fieldType = field.BelongsTo
 			relatePointer = true
 		}
-		relateConfig := y.buildRelateConfig(relate)
+		relateConfig, jsonTag := y.buildRelateConfig(relate)
 
 		generatedTable, exists := y.generatedTable[relate.Table]
 		if !exists {
@@ -187,7 +187,7 @@ func (y *YamlGenerator) getTableRelateOpt(table *Table) []gen.ModelOpt {
 		opt[i] = gen.FieldRelate(fieldType, generatedTable.ModelName, queryStructMeta.QueryStructMeta, &field.RelateConfig{
 			GORMTag:       relateConfig,
 			RelatePointer: relatePointer,
-			JSONTag:       relate.JSONTag,
+			JSONTag:       jsonTag,
 		})
 	}
 
@@ -195,7 +195,7 @@ func (y *YamlGenerator) getTableRelateOpt(table *Table) []gen.ModelOpt {
 }
 
 // buildRelateConfig 构建关联配置
-func (y *YamlGenerator) buildRelateConfig(relate Relate) field.GormTag {
+func (y *YamlGenerator) buildRelateConfig(relate Relate) (field.GormTag, string) {
 	relateConfig := make(field.GormTag)
 
 	type tagMapping struct {
@@ -217,11 +217,17 @@ func (y *YamlGenerator) buildRelateConfig(relate Relate) field.GormTag {
 		}
 	}
 
-	if relate.JSONTag == "" {
-		relate.JSONTag = NamingConversion(relate.Table, y.yaml.Config.TagJsonCamel) + ",omitempty"
+	// 确保 JSONTag 始终包含 omitempty
+	jsonTag := relate.JSONTag
+	if jsonTag == "" {
+		jsonTag = NamingConversion(relate.Table, y.yaml.Config.TagJsonCamel)
+	}
+	// 如果没有 omitempty，自动添加
+	if !strings.Contains(jsonTag, "omitempty") {
+		jsonTag = jsonTag + ",omitempty"
 	}
 
-	return relateConfig
+	return relateConfig, jsonTag
 }
 
 func (y *YamlGenerator) getTableColumnOpt(table *Table) ([]gen.ModelOpt, bool) {
